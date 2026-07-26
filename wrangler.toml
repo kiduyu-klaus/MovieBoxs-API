@@ -5,3 +5,17 @@ compatibility_date = "2024-01-01"
 
 # Free tier: 100K requests/day, 10ms CPU time (streaming I/O doesn't count)
 # The Worker streams video through without buffering → near-zero RAM usage
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = false
+persist = true
+head_sampling_rate = 1
