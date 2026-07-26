@@ -22,3 +22,7 @@ invocation_logs = true
 enabled = true
 persist = true
 head_sampling_rate = 1
+[rate_limiting]
+enabled = true
+requests_per_period = 100
+period = 60
