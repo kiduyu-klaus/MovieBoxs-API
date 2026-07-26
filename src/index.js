@@ -4,12 +4,34 @@
  * A complete port of the Python FastAPI to a zero-RAM Cloudflare Worker.
  * All endpoints use the MovieBox backend JSON APIs directly (no HTML scraping).
  * Video streaming pipes ReadableStream straight through — zero buffering.
+ *
+ * FIXED: Added retry logic with exponential backoff for 429 errors
+ * and edge caching to reduce API calls to upstream services.
  */
 
 const BASE_URL = "https://moviebox.ph";
 const H5_API = "https://h5-api.aoneroom.com";
 const DEFAULT_DOMAIN = "https://123movienow.cc";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+// Cache TTL settings (in seconds)
+const CACHE_TTL = {
+  HOME: 300,        // 5 minutes for home data
+  CATEGORY: 600,    // 10 minutes for category data
+  RANKING: 600,     // 10 minutes for ranking data
+  DETAIL: 3600,     // 1 hour for detail pages
+  EPISODES: 1800,   // 30 minutes for episodes
+  SEARCH: 60,       // 1 minute for search results
+  SUGGEST: 300,     // 5 minutes for suggestions
+};
+
+// Retry configuration
+const RETRY_CONFIG = {
+  maxRetries: 3,
+  baseDelay: 1000,    // 1 second base delay
+  maxDelay: 10000,    // 10 seconds max delay
+  retryOnStatus: [429, 502, 503, 504],
+};
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -18,6 +40,127 @@ const CORS = {
   "Access-Control-Expose-Headers":
     "Content-Length, Content-Range, Accept-Ranges, X-Stream-Resolution",
 };
+
+// ══════════════════════════════════════════════════════════════════
+// Rate Limiting & Caching Utilities
+// ══════════════════════════════════════════════════════════════════
+
+/**
+ * Sleep for specified milliseconds
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Calculate exponential backoff delay with jitter
+ */
+function getBackoffDelay(attempt, baseDelay = RETRY_CONFIG.baseDelay) {
+  const exponentialDelay = baseDelay * Math.pow(2, attempt);
+  const jitter = Math.random() * 1000; // Add jitter to prevent thundering herd
+  return Math.min(exponentialDelay + jitter, RETRY_CONFIG.maxDelay);
+}
+
+/**
+ * Fetch with retry logic and exponential backoff for rate limiting
+ */
+async function fetchWithRetry(url, options = {}, retries = RETRY_CONFIG.maxRetries) {
+  let lastError;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(url, {
+        ...options,
+        headers: {
+          ...options.headers,
+          "User-Agent": UA,
+        },
+      });
+
+      // Check if we should retry based on status code
+      if (RETRY_CONFIG.retryOnStatus.includes(response.status)) {
+        if (attempt < retries) {
+          const delay = getBackoffDelay(attempt);
+          console.log(`Rate limited (${response.status}), retrying in ${Math.round(delay)}ms... (attempt ${attempt + 1}/${retries})`);
+          await sleep(delay);
+          continue;
+        }
+      }
+
+      // Return response if OK or not a retryable error
+      return response;
+    } catch (error) {
+      lastError = error;
+
+      // Network errors - retry
+      if (attempt < retries) {
+        const delay = getBackoffDelay(attempt);
+        console.log(`Network error: ${error.message}, retrying in ${Math.round(delay)}ms... (attempt ${attempt + 1}/${retries})`);
+        await sleep(delay);
+        continue;
+      }
+    }
+  }
+
+  // All retries exhausted
+  throw lastError || new Error("Max retries exceeded");
+}
+
+/**
+ * Create a cache key from URL and optional prefix
+ */
+function getCacheKey(url, prefix = "") {
+  return prefix ? `${prefix}:${url}` : url;
+}
+
+/**
+ * Try to get cached response, fallback to fetch if cache miss
+ * Note: Cloudflare Workers Cache API has size limits (~8MB per entry)
+ * Only cache JSON responses, not streaming responses
+ */
+async function cachedFetch(url, options = {}, cacheKey = null, ttl = 300) {
+  const key = cacheKey || url;
+
+  // Try to get from cache first
+  try {
+    const cache = caches.default;
+    const cachedResponse = await cache.match(key);
+
+    if (cachedResponse) {
+      console.log(`Cache HIT for: ${key}`);
+      return cachedResponse;
+    }
+    console.log(`Cache MISS for: ${key}`);
+  } catch (cacheError) {
+    // Cache not available (e.g., during local dev with wrangler dev)
+    console.log(`Cache unavailable: ${cacheError.message}`);
+  }
+
+  // Fetch from origin
+  const response = await fetchWithRetry(url, options);
+
+  // Only cache successful GET requests with JSON responses
+  if (response.ok && response.headers.get("Content-Type")?.includes("application/json")) {
+    try {
+      const cache = caches.default;
+      const body = await response.clone().json();
+      const cacheResponse = new Response(JSON.stringify(body), {
+        status: response.status,
+        headers: {
+          "Content-Type": "application/json",
+          "Cache-Control": `public, max-age=${ttl}`,
+          ...CORS,
+        },
+      });
+      await cache.put(key, cacheResponse);
+      console.log(`Cached response for: ${key} (TTL: ${ttl}s)`);
+    } catch (e) {
+      console.log(`Failed to cache: ${e.message}`);
+    }
+  }
+
+  return response;
+}
 
 // ══════════════════════════════════════════════════════════════════
 // Router
@@ -95,6 +238,7 @@ export default {
 
       return json({ error: "Not found" }, 404);
     } catch (err) {
+      console.error(`Error: ${err.message}`);
       return json({ error: err.message || "Internal error" }, 500);
     }
   },
@@ -107,8 +251,13 @@ export default {
 function handleRoot() {
   return json({
     api: "MovieBox API",
-    version: "4.0.0",
+    version: "4.1.0",
     runtime: "Cloudflare Worker (zero RAM)",
+    features: {
+      rate_limiting_handling: true,
+      edge_caching: true,
+      retry_with_backoff: true,
+    },
     endpoints: {
       home: {
         "/home": "Get home page data (banners and sections)",
@@ -161,11 +310,16 @@ function handleRoot() {
 // ══════════════════════════════════════════════════════════════════
 
 async function fetchHomeData() {
-  const resp = await fetch(
-    `${H5_API}/wefeed-h5api-bff/home?host=moviebox.ph`,
-    { headers: { "User-Agent": UA } }
-  );
+  const apiUrl = `${H5_API}/wefeed-h5api-bff/home?host=moviebox.ph`;
+  const cacheKey = getCacheKey(apiUrl, "home");
+
+  const resp = await cachedFetch(apiUrl, {}, cacheKey, CACHE_TTL.HOME);
+
+  if (resp.status === 429) {
+    throw new Error("Rate limited by upstream API. Please try again later.");
+  }
   if (!resp.ok) throw new Error(`Home API returned ${resp.status}`);
+
   const body = await resp.json();
   const ops = body?.data?.operatingList || [];
 
@@ -289,17 +443,20 @@ async function fetchCategoryData(category) {
   };
   const filterType = typeMap[category] || category;
 
-  const resp = await fetch(
-    `${H5_API}/wefeed-h5api-bff/subject/filter?type=${filterType}&page=1&perPage=60`,
-    {
-      headers: {
-        "User-Agent": UA,
-        accept: "application/json",
-      },
-    }
-  );
+  const apiUrl = `${H5_API}/wefeed-h5api-bff/subject/filter?type=${filterType}&page=1&perPage=60`;
+  const cacheKey = getCacheKey(apiUrl, `category:${category}`);
 
+  const resp = await cachedFetch(apiUrl, {
+    headers: {
+      accept: "application/json",
+    },
+  }, cacheKey, CACHE_TTL.CATEGORY);
+
+  if (resp.status === 429) {
+    throw new Error("Rate limited by upstream API. Please try again later.");
+  }
   if (!resp.ok) throw new Error(`Category API returned ${resp.status}`);
+
   const body = await resp.json();
   const items = body?.data?.items || [];
 
@@ -375,11 +532,18 @@ async function handleCategorySectionByName(category, name) {
 // ══════════════════════════════════════════════════════════════════
 
 async function fetchRankingData() {
-  const resp = await fetch(
-    `${H5_API}/wefeed-h5api-bff/subject/rank-list`,
-    { headers: { "User-Agent": UA, accept: "application/json" } }
-  );
+  const apiUrl = `${H5_API}/wefeed-h5api-bff/subject/rank-list`;
+  const cacheKey = getCacheKey(apiUrl, "ranking");
+
+  const resp = await cachedFetch(apiUrl, {
+    headers: { accept: "application/json" },
+  }, cacheKey, CACHE_TTL.RANKING);
+
+  if (resp.status === 429) {
+    throw new Error("Rate limited by upstream API. Please try again later.");
+  }
   if (!resp.ok) throw new Error(`Ranking API returned ${resp.status}`);
+
   const body = await resp.json();
   const lists = body?.data || [];
 
@@ -452,15 +616,21 @@ async function handleSearchSuggest(params) {
   const q = params.get("q");
   if (!q) return json({ error: "q parameter required" }, 400);
 
-  const resp = await fetch(
+  // Don't cache search suggestions as they're query-specific
+  const resp = await fetchWithRetry(
     `${H5_API}/wefeed-h5api-bff/subject/search-suggest`,
     {
       method: "POST",
-      headers: { "User-Agent": UA, "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ keyword: q, perPage: 10 }),
     }
   );
+
+  if (resp.status === 429) {
+    return json({ error: "Rate limited. Please wait a moment and try again." }, 429);
+  }
   if (!resp.ok) return json({ error: "Search API failed" }, 502);
+
   const body = await resp.json();
   const items = body?.data?.items || [];
   return json({
@@ -473,15 +643,21 @@ async function handleSearch(params) {
   const q = params.get("q");
   if (!q) return json({ error: "q parameter required" }, 400);
 
-  const resp = await fetch(
+  // Don't cache search results
+  const resp = await fetchWithRetry(
     `${H5_API}/wefeed-h5api-bff/subject/search`,
     {
       method: "POST",
-      headers: { "User-Agent": UA, "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ keyword: q, perPage: 30, page: 1 }),
     }
   );
+
+  if (resp.status === 429) {
+    return json({ error: "Rate limited. Please wait a moment and try again." }, 429);
+  }
   if (!resp.ok) return json({ error: "Search API failed" }, 502);
+
   const body = await resp.json();
   const items = body?.data?.items || [];
 
@@ -503,12 +679,33 @@ async function handleSearch(params) {
 
 async function handleDetail(slug) {
   const pageUrl = `${BASE_URL}/detail/${slug}`;
-  const resp = await fetch(pageUrl, {
-    headers: { "User-Agent": UA },
+  const cacheKey = getCacheKey(pageUrl, "detail");
+
+  // Try cache first
+  let html;
+  try {
+    const cache = caches.default;
+    const cachedResponse = await cache.match(cacheKey);
+    if (cachedResponse) {
+      console.log(`Cache HIT for detail: ${slug}`);
+      const cachedBody = await cachedResponse.json();
+      return json(cachedBody);
+    }
+  } catch (e) {
+    console.log(`Cache check failed: ${e.message}`);
+  }
+
+  // Fetch from origin with retry
+  const resp = await fetchWithRetry(pageUrl, {
     redirect: "follow",
   });
+
+  if (resp.status === 429) {
+    return json({ error: "Rate limited by upstream API. Please try again later." }, 429);
+  }
   if (!resp.ok) return json({ error: "Movie not found" }, 404);
-  const html = await resp.text();
+
+  html = await resp.text();
 
   // Extract __NUXT_DATA__
   const match = html.match(
@@ -569,7 +766,7 @@ async function handleDetail(slug) {
     (v) => typeof v === "string" && (v.includes(".m3u8") || v.includes("/m3u8/"))
   );
 
-  return json({
+  const result = {
     slug,
     source: pageUrl,
     metadata: {
@@ -598,7 +795,26 @@ async function handleDetail(slug) {
         })),
     },
     streams: { mp4: mp4Urls, hls: hlsUrls },
-  });
+  };
+
+  // Cache the result
+  try {
+    const cache = caches.default;
+    const cacheResponse = new Response(JSON.stringify(result), {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json",
+        "Cache-Control": `public, max-age=${CACHE_TTL.DETAIL}`,
+        ...CORS,
+      },
+    });
+    await cache.put(cacheKey, cacheResponse);
+    console.log(`Cached detail for: ${slug}`);
+  } catch (e) {
+    console.log(`Failed to cache detail: ${e.message}`);
+  }
+
+  return json(result);
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -606,11 +822,16 @@ async function handleDetail(slug) {
 // ══════════════════════════════════════════════════════════════════
 
 async function handleEpisodes(slug) {
-  const resp = await fetch(
-    `${H5_API}/wefeed-h5api-bff/detail?detailPath=${slug}`,
-    { headers: { "User-Agent": UA } }
-  );
+  const apiUrl = `${H5_API}/wefeed-h5api-bff/detail?detailPath=${slug}`;
+  const cacheKey = getCacheKey(apiUrl, "episodes");
+
+  const resp = await cachedFetch(apiUrl, {}, cacheKey, CACHE_TTL.EPISODES);
+
+  if (resp.status === 429) {
+    return json({ error: "Rate limited by upstream API. Please try again later." }, 429);
+  }
   if (!resp.ok) return json({ error: "Movie/Series not found" }, 404);
+
   const body = await resp.json();
   const data = body?.data || {};
   const resource = data.resource || {};
@@ -635,11 +856,11 @@ async function handleEpisodes(slug) {
         name: `Episode ${i}`,
         ep: i,
         se: s.se,
-        watch_url: subjectId 
-          ? `/watch/${subjectId}?detail_path=${slug}&se=${s.se}&ep=${i}` 
+        watch_url: subjectId
+          ? `/watch/${subjectId}?detail_path=${slug}&se=${s.se}&ep=${i}`
           : null,
-        stream_api_url: subjectId 
-          ? `/api/stream/${subjectId}?detail_path=${slug}&se=${s.se}&ep=${i}` 
+        stream_api_url: subjectId
+          ? `/api/stream/${subjectId}?detail_path=${slug}&se=${s.se}&ep=${i}`
           : null
       });
     }
@@ -664,9 +885,9 @@ async function handleEpisodes(slug) {
 
 async function discoverDomain() {
   try {
-    const resp = await fetch(
+    const resp = await fetchWithRetry(
       `${H5_API}/wefeed-h5api-bff/media-player/get-domain`,
-      { headers: { "User-Agent": UA, "X-Client-Type": "h5" } }
+      { headers: { "X-Client-Type": "h5" } }
     );
     if (resp.ok) {
       const d = await resp.json();
@@ -678,13 +899,12 @@ async function discoverDomain() {
 
 async function fetchStreams(domain, subjectId, detailPath, se, ep) {
   const playUrl = `${domain}/wefeed-h5api-bff/subject/play?subjectId=${subjectId}&se=${se}&ep=${ep}&detailPath=${detailPath}`;
-  const resp = await fetch(playUrl, {
+  const resp = await fetchWithRetry(playUrl, {
     headers: {
       accept: "application/json",
       referer: `${domain}/spa/videoPlayPage/movies/${detailPath}`,
       "x-client-info": '{"timezone":"Asia/Dhaka"}',
       cookie: "uuid=d8c3539e-2e46-4000-af20-7046a856e30a",
-      "User-Agent": UA,
     },
   });
   if (!resp.ok) throw new Error(`Play API returned ${resp.status}`);
@@ -723,9 +943,8 @@ async function handleStreamApi(subjectId, params) {
   if (streamId) {
     try {
       const capUrl = `${H5_API}/wefeed-h5api-bff/subject/caption?subjectId=${subjectId}&id=${streamId}&detailPath=${detailPath}`;
-      const capResp = await fetch(capUrl, {
-        headers: { 
-          "User-Agent": UA, 
+      const capResp = await fetchWithRetry(capUrl, {
+        headers: {
           accept: "application/json",
           "x-client-info": '{"timezone":"Asia/Dhaka"}',
           cookie: "uuid=d8c3539e-2e46-4000-af20-7046a856e30a"
@@ -795,14 +1014,13 @@ async function handleWatch(subjectId, params, request) {
     Referer: `${domain}/`,
     Origin: domain,
     Accept: "*/*",
-    "User-Agent": UA,
   };
 
   // Forward Range header for seeking
   const rangeHeader = request.headers.get("Range");
   if (rangeHeader) cdnHeaders["Range"] = rangeHeader;
 
-  const vidResp = await fetch(streamUrl, {
+  const vidResp = await fetchWithRetry(streamUrl, {
     headers: cdnHeaders,
     redirect: "follow",
   });
